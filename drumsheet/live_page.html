@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drumsheet - live</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #dddbd3;
+    --accent: #1f6f5c; --accent-ink: #ffffff; --warn: #a8321f; --lane: #efeee9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #171715; --panel: #20201d; --ink: #ecebe6; --muted: #9c9b95; --line: #36352f;
+            --accent: #58b79f; --accent-ink: #0d1f1a; --warn: #f08a76; --lane: #262622; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 14px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: end; background: var(--panel);
+         border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  select, input[type=text], input[type=number] { font: inherit; color: var(--ink); background: var(--bg);
+         border: 1px solid var(--line); border-radius: 7px; padding: 6px 8px; min-width: 0; }
+  select { max-width: 260px; }
+  button { font: inherit; font-weight: 600; border: 1px solid var(--accent); background: var(--accent);
+           color: var(--accent-ink); border-radius: 7px; padding: 7px 16px; cursor: pointer; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button.stop { background: var(--warn); border-color: var(--warn); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  .grow { flex: 1 1 auto; }
+  .meter { width: 150px; height: 8px; background: var(--lane); border-radius: 4px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .08s linear; }
+  .status { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 150px; text-align: right; }
+  .stage { margin-top: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 10px; display: grid; grid-template-columns: 148px 1fr; gap: 0 10px; }
+  .pads { display: grid; grid-auto-rows: 1fr; gap: 4px; }
+  .pad { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 10px;
+         border-radius: 7px; background: var(--lane); border-left: 5px solid var(--c);
+         transition: background .25s ease-out; white-space: nowrap; overflow: hidden; }
+  .pad.hit { background: var(--c); color: #111; transition: none; }
+  .pad b { font-weight: 600; font-size: 13px; }
+  .pad span { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
+  .pad.hit span { color: #111; }
+  canvas { width: 100%; height: 100%; display: block; border-radius: 7px; }
+  .after { margin-top: 12px; display: none; }
+  .after.show { display: flex; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+        white-space: pre-wrap; margin: 12px 0 0; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .links a { color: var(--accent); font-weight: 600; margin-right: 14px; }
+  .err { color: var(--warn); margin-top: 8px; min-height: 1.2em; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  @media (max-width: 640px) { .stage { grid-template-columns: 96px 1fr; } .pad span { display: none; }
+                              .status { text-align: left; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Live capture</h1>
+  <p class="sub">Play, and each stroke shows up on its drum's lane about a quarter of a second later.
+     Stop to turn the take into a chart.</p>
+
+  <div class="bar">
+    <label>Model <select id="model"></select></label>
+    <label>Input <select id="device"></select></label>
+    <label>Sensitivity <input id="sens" type="number" min="0.5" max="2" step="0.1" value="1" style="width:78px"></label>
+    <label class="grow">Test without a mic: path of an audio file (optional)
+      <input id="simulate" type="text" placeholder="e.g. examples/demo_groove.flac"></label>
+    <button id="go">Start</button>
+    <div>
+      <div class="meter" title="input level"><i id="level"></i></div>
+      <div class="status" id="status">idle</div>
+    </div>
+  </div>
+  <div class="err" id="err"></div>
+
+  <div class="stage">
+    <div class="pads" id="pads"></div>
+    <div><canvas id="roll"></canvas></div>
+  </div>
+  <p class="hint" id="modelhint"></p>
+
+  <div class="bar after" id="after">
+    <label>Title <input id="title" type="text" value="Live take"></label>
+    <label>Grid <select id="grid"></select></label>
+    <label>Chart model <select id="chartmodel"></select></label>
+    <button id="chart">Make drum sheet from this take</button>
+    <span class="links" id="links"></span>
+  </div>
+  <pre id="summary" style="display:none"></pre>
+</main>
+
+<script>
+const COLORS = { crash:"#E69F00", ride:"#C9A227", hihat_open:"#56B4E9", hihat_closed:"#2A9D8F",
+                 tom_high:"#CC79A7", tom_mid:"#B5669A", tom_floor:"#8E4E86", snare:"#D55E00", kick:"#3B7DD8" };
+const SECONDS = 8;                      // how much history the lanes show
+const $ = id => document.getElementById(id);
+let drums = [], hits = [], counts = {}, es = null, running = false;
+let clock = { t: 0, at: performance.now() };      // session time and when we learned it
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: { "Content-Type": "application/json" },
+                                       body: JSON.stringify(body) } : undefined);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+
+async function init() {
+  const info = await api("/live/api/info");
+  drums = info.drums;
+  for (const sel of [$("model"), $("chartmodel")]) {
+    sel.innerHTML = "";
+    for (const m of info.models) {
+      const o = new Option(m.label + (m.available ? "" : " (not installed)"), m.key);
+      o.disabled = !m.available; o.title = m.available ? m.description : m.hint;
+      sel.add(o);
+    }
+  }
+  const hint = () => { const m = info.models.find(m => m.key === $("model").value);
+                       $("modelhint").textContent = m ? m.label + ": " + m.description : ""; };
+  $("model").onchange = hint; hint();
+  $("device").innerHTML = "";
+  if (!info.devices.length) $("device").add(new Option("no microphone found", ""));
+  for (const d of info.devices) $("device").add(new Option(d.name, d.index, d.default, d.default));
+  for (const g of info.grids) $("grid").add(new Option({ "8":"8th notes","16":"16th notes","8t":"8th triplets","16t":"16th triplets" }[g] || g, g, g === "16", g === "16"));
+  $("pads").innerHTML = "";
+  for (const d of drums) {
+    const el = document.createElement("div");
+    el.className = "pad"; el.id = "pad-" + d.key; el.style.setProperty("--c", COLORS[d.key] || "#888");
+    el.innerHTML = `<b>${d.label}</b><span id="n-${d.key}">0</span>`;
+    $("pads").appendChild(el);
+  }
+  $("pads").style.height = (drums.length * 40) + "px";
+  if (info.running) attach();           // page reloaded during a session
+  requestAnimationFrame(draw);
+}
+
+function attach() {
+  running = true; hits = []; counts = {};
+  for (const d of drums) $("n-" + d.key).textContent = "0";
+  $("go").textContent = "Stop"; $("go").classList.add("stop");
+  $("after").classList.remove("show"); $("summary").style.display = "none"; $("links").innerHTML = "";
+  es = new EventSource("/live/api/events");
+  es.onmessage = ev => {
+    const e = JSON.parse(ev.data);
+    if (e.type === "hit") {
+      hits.push(e);
+      counts[e.drum] = (counts[e.drum] || 0) + 1;
+      const n = $("n-" + e.drum); if (n) n.textContent = counts[e.drum];
+      const pad = $("pad-" + e.drum);
+      if (pad && e.t > clock.t - 1) { pad.classList.add("hit"); setTimeout(() => pad.classList.remove("hit"), 90); }
+    } else if (e.type === "level") {
+      clock = { t: e.t, at: performance.now() };
+      $("level").style.width = Math.max(0, Math.min(100, (e.db + 60) * 1.7)) + "%";
+      $("status").textContent = e.t.toFixed(1) + " s  ·  " + hits.length + " hits";
+    } else if (e.type === "end") {
+      if (e.error) $("err").textContent = e.error;
+      if (running) finish();           // the source ended by itself (file played to the end)
+    }
+  };
+}
+
+async function finish() {
+  running = false;
+  if (es) { es.close(); es = null; }
+  $("go").textContent = "Start"; $("go").classList.remove("stop"); $("go").disabled = true;
+  try {
+    const r = await api("/live/api/stop", {});
+    $("status").textContent = `take: ${r.seconds} s  ·  ${r.hits} hits`;
+    $("chartmodel").value = $("model").value;
+    $("after").classList.add("show");
+  } catch (e) { $("err").textContent = e.message; }
+  $("go").disabled = false; $("level").style.width = "0";
+}
+
+$("go").onclick = async () => {
+  $("err").textContent = "";
+  if (running) return finish();
+  $("go").disabled = true;
+  try {
+    await api("/live/api/start", { model: $("model").value, device: $("device").value || null,
+                                   simulate: $("simulate").value.trim() || null,
+                                   sensitivity: parseFloat($("sens").value) || 1 });
+    clock = { t: 0, at: performance.now() };
+    attach();
+  } catch (e) { $("err").textContent = e.message; }
+  $("go").disabled = false;
+};
+
+$("chart").onclick = async () => {
+  $("chart").disabled = true; $("err").textContent = ""; $("links").textContent = "working…";
+  try {
+    const r = await api("/live/api/chart", { model: $("chartmodel").value, title: $("title").value,
+                                            grid: $("grid").value, style: "both" });
+    $("links").innerHTML = r.files.map(f => `<a href="${f.url}" target="_blank">${f.kind.toUpperCase()}</a>`).join("");
+    $("summary").textContent = r.summary; $("summary").style.display = "block";
+  } catch (e) { $("links").textContent = ""; $("err").textContent = e.message; }
+  $("chart").disabled = false;
+};
+
+function draw() {
+  const cv = $("roll"), box = $("pads").getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = box.height;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); cv.style.height = h + "px";
+  }
+  const g = cv.getContext("2d"), css = getComputedStyle(document.documentElement);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const now = running ? clock.t + (performance.now() - clock.at) / 1000 : clock.t;
+  const laneH = h / Math.max(drums.length, 1), px = w / SECONDS;
+  drums.forEach((d, i) => {             // lanes
+    g.fillStyle = css.getPropertyValue("--lane");
+    g.fillRect(0, i * laneH + 2, w, laneH - 4);
+  });
+  g.strokeStyle = css.getPropertyValue("--line"); g.lineWidth = 1;      // one tick per second
+  g.fillStyle = css.getPropertyValue("--muted"); g.font = "10px ui-sans-serif, system-ui";
+  for (let s = Math.ceil(now - SECONDS); s <= now; s++) {
+    if (s < 0) continue;
+    const x = w - (now - s) * px;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
+    g.fillText(s + "s", x + 3, 10);
+  }
+  for (const e of hits) {               // hits
+    const age = now - e.t;
+    if (age > SECONDS || age < -0.5) continue;
+    const i = drums.findIndex(d => d.key === e.drum);
+    if (i < 0) continue;
+    const x = w - age * px, r = 4 + 6 * Math.min(1, e.vel / 127);
+    g.fillStyle = COLORS[e.drum] || "#888";
+    g.beginPath(); g.arc(x, (i + 0.5) * laneH, r, 0, 6.2832); g.fill();
+  }
+  if (hits.length > 4000) hits = hits.slice(-2000);
+  requestAnimationFrame(draw);
+}
+
+init().catch(e => { $("err").textContent = e.message; });
+</script>
+</body>
+</html>

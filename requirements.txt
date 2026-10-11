@@ -1,0 +1,20 @@
+# Core (required). librosa brings scikit-learn and joblib, which "Train my kit" uses.
+numpy>=1.24
+scipy>=1.10
+librosa>=0.10
+soundfile>=0.12
+reportlab>=4.0
+pretty_midi>=0.2.10
+
+# Web UI incl. the live view (python app.py). Brings FastAPI and uvicorn.
+gradio>=4.0
+
+# Microphone: live view, guided kit recording, --record
+sounddevice>=0.4
+
+# Drum separation for full songs with the built-in / kit models (pulls in PyTorch)
+demucs>=4.0.1
+
+# --- optional model: ADTOF neural network (non-commercial licence, CC BY-NC-SA) ---
+# pip install torch
+# pip install git+https://github.com/xavriley/ADTOF-pytorch.git
