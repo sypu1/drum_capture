@@ -1,8 +1,11 @@
 """The graphical live view: a small local web page.
 
 Served by app.py next to the Gradio UI (http://127.0.0.1:7860/live).  The audio
-is captured by Python (sounddevice), not by the browser, so the delay is only
-the model's settle time.  Hits travel to the page as server-sent events.
+is normally captured by Python (sounddevice), not by the browser, so the delay
+is only the model's settle time.  When the page is open on another machine - a
+phone - it can record with its own microphone instead and post the audio here
+(browsers only allow that over https or on localhost).  Hits travel to the page
+as server-sent events.
 """
 from __future__ import annotations
 
@@ -13,14 +16,15 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+import numpy as np
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .audio_io import AudioError
 from .backends import all_backends, get_backend
 from .config import DRUM_ORDER, DRUMS, GRIDS
-from .live import FileSource, LiveSession, MicSource, list_input_devices
+from .live import BrowserSource, FileSource, LiveSession, MicSource, list_input_devices
 
 router = APIRouter()
 _lock = threading.Lock()
@@ -31,8 +35,14 @@ class StartRequest(BaseModel):
     model: str = "builtin"
     device: str | None = None
     simulate: str | None = None       # path of a file to play through the view instead of the mic
+    # set when the page records with its own microphone: the sample rate of what it will post
+    browser_rate: int | None = Field(None, ge=8000, le=192000)
     sensitivity: float = 1.0
-    gate_db: float = -45.0
+    gate_db: float = -30.0
+
+
+class GateRequest(BaseModel):
+    gate_db: float
 
 
 class ChartRequest(BaseModel):
@@ -70,6 +80,8 @@ def start(req: StartRequest):
                 if not Path(req.simulate).expanduser().is_file():
                     raise AudioError(f"File not found: {req.simulate}")
                 source = FileSource(Path(req.simulate).expanduser())
+            elif req.browser_rate:
+                source = BrowserSource(req.browser_rate)
             else:
                 dev = req.device
                 source = MicSource(int(dev) if dev and dev.isdigit() else (dev or None))
@@ -79,6 +91,28 @@ def start(req: StartRequest):
         _state["take"] = None
         _state["session"] = LiveSession(source, backend, sensitivity=req.sensitivity,
                                         gate_db=req.gate_db).start()
+    return dict(ok=True)
+
+
+@router.post("/live/api/gate")
+def gate(req: GateRequest):
+    """Move the gate of the running session (the page's slider)."""
+    session = _state["session"]
+    if session is None:
+        raise HTTPException(404, "No session.")
+    session.engine.set_gate(req.gate_db)
+    return dict(ok=True)
+
+
+@router.post("/live/api/audio")
+async def audio(request: Request):
+    """The next piece of what the page's microphone recorded: mono 16-bit PCM
+    (little-endian) at the rate given to start."""
+    session = _state["session"]
+    if session is None or not session.running or not isinstance(session.source, BrowserSource):
+        raise HTTPException(409, "No live session is waiting for audio from the browser.")
+    data = await request.body()
+    session.source.push(np.frombuffer(data[:len(data) // 2 * 2], dtype="<i2").astype(np.float32) / 32768)
     return dict(ok=True)
 
 

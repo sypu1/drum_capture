@@ -30,6 +30,7 @@ Optional pieces:
 | Web UI and live view | `pip install gradio sounddevice` |
 | Full songs with the built-in or kit models | `pip install demucs` (pulls in PyTorch; downloads its model on first use) |
 | The ADTOF model | `pip install torch` then `pip install git+https://github.com/xavriley/ADTOF-pytorch.git` |
+| Sheets as photos or PDFs (for training) | [Audiveris](https://github.com/Audiveris/audiveris/releases), a separate program (AGPL): install it, or unpack it and point `AUDIVERIS` at its launcher. `pip install pillow-heif` for iPhone HEIC photos |
 
 On macOS the first microphone use asks for permission for your terminal
 (System Settings > Privacy & Security > Microphone).
@@ -88,6 +89,13 @@ hand-off was checked against Demucs' command line, and one run on a Mac showed
 the separation step executing; how accurate the models are on Demucs stems has
 not been measured.
 
+GPU: with an NVIDIA card and a CUDA build of PyTorch, `adtof` and Demucs run
+on the GPU without any option; `python app.py` says at startup which device
+they will use. For two minutes of audio the ADTOF network then needs 0.04 s
+instead of 3 s (RTX 3090 against its 72-core host). `builtin` and kit models
+are not neural networks and always use the CPU. `CUDA_VISIBLE_DEVICES=`
+(empty) forces everything onto the CPU.
+
 ### Using another program's transcription
 
 ```bash
@@ -131,10 +139,30 @@ drum's lane about a quarter of a second later (the model needs to hear a
 little of what follows a hit). Stop, and the take is saved and turned into a
 chart by the normal, more accurate whole-take pass.
 
+The inputs are the microphones of the computer running drumsheet and "This
+browser's microphone". Use the second when the page is open on another device,
+a phone next to the kit for example: the page records there and sends the
+audio over. Browsers only hand out the microphone on https pages (or on
+localhost), so reach drumsheet through something that adds https, such as
+`tailscale serve`. Keep the page in front and the screen on: phones stop
+recording in the background.
+
+Sounds quieter than -30 dB are never shown as hits ("Ignore quieter than" on
+the page, `--gate-db` in the terminal). The mark on the level meter is that
+limit, and the bar turns grey for sounds below it: raise the slider until the
+room's background stays grey, lower it if soft strokes are missed - it works
+while you play. Once you have played, anything more than 24 dB below your
+loudest stroke is ignored as well. This matters most for the built-in rules:
+they judge loudness only against the rest of the recording, so any tap or
+word that gets past the limit is named as some drum. `adtof` was trained to
+pick drums out of full songs and mostly ignores other sounds.
+
 The live view was tested by streaming files through it in real time, in a
-real browser. **Capturing from an actual microphone could not be tested**
-where this was built. If it fails, `python -m drumsheet live --list-devices`
-shows what Python can see.
+real browser; the browser's microphone was tested the same way, in Chromium
+with a file standing in for its microphone. **Capturing from an actual
+microphone, on the computer or on a phone, could not be tested** where this
+was built. If it fails, `python -m drumsheet live --list-devices` shows what
+Python can see.
 
 ## Train a model on your kit
 
@@ -151,6 +179,11 @@ python -m drumsheet take.wav --model kit:home
 ```
 
    or use the **Train my kit** tab, which records or uploads each drum.
+   Record them the way you will play: the model learns the sound of the
+   microphone as much as that of the drums. (The tab's recorder asks the
+   browser for the plain microphone, as the Live tab does. It used to get the
+   phone-call version, with automatic gain and noise suppression, and a kit
+   recorded that way did not know its own drums on the Live tab.)
 3. Improve it with real playing - the most effective step in tests:
    transcribe a take, fix the MIDI in MuseScore or a DAW, and train again
    with both:
@@ -160,13 +193,123 @@ python -m drumsheet train home --dir calib/ --pair take1.wav take1_fixed.mid --p
 ```
 
 Training takes under a minute on a laptop and prints a self-test score per
-drum. How it works: the single hits are cut out and mixed with each other
+drum; below 0.75 the result says in so many words that the drum is not
+reliable yet. When a trained model plays back less sure than it trained (a
+different room, microphone or level), a stroke no drum reaches the threshold
+for still gets its likeliest drum rather than disappearing. How it works: the single hits are cut out and mixed with each other
 thousands of times at random levels and offsets (in real playing drums are
 mostly hit together), and a small classifier per drum learns "is this drum in
 this stroke?" from the stroke's spectrum. Corrected takes add real strokes in
 context. Models are saved in `kits/`; training again under the same name
 replaces the model, so keep your calibration recordings (the web UI stores
 them in `kits/NAME_recordings/`).
+
+### From a sheet and your cover of it
+
+The quickest way to get real, labelled playing: play a piece you have the sheet
+of, record it on your setup, and give both.
+
+```bash
+python -m drumsheet train home --sheet my_cover.wav the_sheet.mid
+python -m drumsheet train home --sheet my_cover.m4a the_sheet.pdf
+python -m drumsheet train home --sheet my_cover.m4a page1.jpg page2.jpg      # photos of the pages, in order
+python -m drumsheet train home --sheet a.wav a.musicxml --sheet b.wav b.mid --dir calib/
+```
+
+or the first upload box of the **Train my kit** tab. There, a sheet uploaded
+without a recording goes with the take you last recorded on the Live tab,
+which is the best recording to use: the model then learns the sound the Live
+tab hears. No one-drum recordings are needed, though they still help, above
+all for a drum the piece rarely uses.
+
+- The sheet can be **MIDI or MusicXML** (`.mid`, `.musicxml`, `.mxl`), **a
+  PDF, or photos of its pages** (see below). Prefer MIDI where there is a
+  choice: it has every repeat and jump already written out. From MusicXML and
+  from pictures, repeat signs, first and second endings and "%" bars are
+  followed; D.C., D.S. and coda jumps are not.
+- You do not have to match the sheet's tempo, keep the tempo steady, or start
+  the recording at any particular moment: the sheet is lined up with the take
+  piece by piece (`drumsheet/sheet.py`), learning on the way what each drum
+  sounds like in this recording. A repeat you skipped or played once more is
+  followed too. Training prints what it found, for example
+  `605 of the sheet's 616 strokes found, starting at 4.0 s, played at 94 % of
+  the sheet's tempo`, and which seconds of the take do not follow the sheet.
+- The model learns what the sheet says, not what you played. Where the two
+  differ - a ghost note that is not written, a fill you simplified - it learns
+  something wrong, so pick a piece you play as written.
+- Length matters more than anything: a drum needs a few dozen strokes to be
+  learned, and a short take has its toms and crashes only a handful of times.
+
+Tested with takes built from the bars of the demo groove in a shuffled order,
+the tempo wandering by up to 8 %, with the sheet written at another tempo:
+all strokes got the labels of what was really played, also with a bar played
+twice, with four bars skipped (one stroke of 387 wrong) and with the timing
+20 ms off the sheet (96 % at 35 ms). An unrelated sheet was refused. A kit
+trained on one such take alone scored F1 0.98 on another one (`builtin` 0.94,
+`adtof` 0.99) - but both takes are made of the same eight bars of the same
+sampled kit, so this shows that the route works, not how good the model will
+be. Lining up a 3.5-minute take takes about ten seconds.
+
+On real playing it has been tried once, on two phone recordings of one player
+(14 s and 8 s: a beat and a tom fill, dull sound with nothing above 4 kHz, the
+tempo changing by 9 % within two bars). There was no sheet, so one was written
+for each afterwards from the pitches of the strokes - a reading of the takes,
+not the player's own sheet. Every written stroke was found in both. A kit
+trained on the 14 s take named 14 of the 19 strokes of the other correctly
+(`builtin`: 12, with 24 false hits; `adtof` heard nothing); the five misses
+were toms and the kick that ends the fill, and the training take has each tom
+only twice. **The player's own sheet has not been tried yet.**
+
+#### A photo or a PDF of the sheet
+
+Needs Audiveris (see Install). Takes about half a minute per page; what was
+read is kept in `~/.cache/drumsheet/`, so training again is quick.
+
+- **What it has to be:** printed drum notation on five-line staves, in the
+  usual drum key: x above the top line hi-hat, x on a ledger line above crash,
+  x on the top line ride, third space snare, top space and fourth line the
+  rack toms, second space floor tom, bottom space kick. A sheet in another key
+  is read as if it were this one, so its drums come out renamed. Handwriting
+  and tablature are not read.
+- **Photos:** one per page, the whole page in the picture, sharp, taken from
+  roughly above. Tilt, slant and uneven light are taken out first
+  (`straighten()` in `drumsheet/omr.py`), a curled page is not flattened.
+  Let the page fill the picture: a phone then has the staff lines some 25
+  pixels apart, and the photo that failed in the tests below had them 13
+  apart and blurred. A scan made with the phone's document scanner (a PDF)
+  should read best; that has not been tried.
+- **What is read:** which drum, when, repeats, endings, "%" bars, triplets
+  (also where the "3" is only printed the first few times). **Not read:** the
+  "o" of an open hi-hat (it becomes a closed one), the tempo mark (120 is
+  assumed; a piece played slower than 60 or faster than 240 is then not
+  found), accents and the brackets of ghost notes (those notes count as
+  ordinary ones). Grace notes and the hi-hat played with the foot are left
+  out.
+- Training prints what it read, e.g. `32 bars, 430 notes read (closed hi-hat
+  215, kick 86, ...)`. Compare the number of bars with your sheet: if staves
+  are missing the photo was too small or too blurred, take it again closer.
+
+How it works: Audiveris finds the symbols; which drum and when is worked out
+here from what it saw (place on the staff and shape of the head; stems up and
+down as two voices; notes printed above each other sound together), because
+its own score falls apart when it misses a clef or a rest.
+
+Tested on three sheets made for the purpose, with known notes, as PDF and as
+simulated phone photos (page turned and seen at an angle on a dark desk,
+uneven light, blur, noise). No photo taken with a real phone and no sheet from
+a publisher has been tried.
+
+| sheet | as PDF | photos |
+|---|---|---|
+| 13 bars, LilyPond, two voices, fills, ride | 149 of 152 notes | 149, 141 and 148 of 152 (turned 0, 2.5 and 5 degrees); turned 8 degrees with a strong slant 110, and only 60 of those in the right bar |
+| 14 bars, LilyPond, sixteenths, repeat with two endings, "%" bars, triplets | 203 of 205 | not tried |
+| 32 bars, MuseScore, a full page | 421 of 430 | 421 of 430 turned 1 degree; 178 of 430 turned 2.5 degrees and more blurred (four of the eight staves were not found) |
+
+The notes missing from the PDFs are the open hi-hats and one crash written as
+a whole note. Training from the 32-bar PDF and from its photo gave 276 of 285
+strokes the same labels as training from the exact sheet. drumsheet's own
+chart PDFs read poorly (25 of 100 notes): they are drawn, not set in a music
+font. Use the MusicXML or MIDI that comes with them.
 
 This is a kit-specific model, not a fine-tune of the ADTOF network. Fine-tuning
 ADTOF would need hours of labelled recordings and is not implemented.
@@ -196,6 +339,9 @@ ADTOF would need hours of labelled recordings and is not implemented.
   seconds were transcribed.
 - **Dull sound**: the built-in rules also look for hi-hats at 3-7.5 kHz and
   accept a kick that reads as high as 150 Hz. `adtof` has no such adaptation.
+  A hi-hat played together with a kick leaves no trace on such a recording,
+  so it is written without being heard, wherever hi-hat strokes are running
+  within three places on both sides of the kick.
 - **Do not force Demucs** on a recording of just a kit.
 - Tempo is cross-checked against the hi-hat pulse and the snare backbeat. If
   it is still wrong, give `--bpm`.
@@ -221,6 +367,8 @@ edit notes, open the `.musicxml` in MuseScore.
 | `drumsheet/config.py` | kit definition and every threshold of the built-in rules |
 | `drumsheet/backends/` | the models: `builtin.py`, `adtof.py`, and the plug-in registry |
 | `drumsheet/kit_model.py` | training and using a model for your own kit |
+| `drumsheet/sheet.py` | reading a sheet (MIDI, MusicXML) and finding its notes in a recording of it |
+| `drumsheet/omr.py` | a photo or PDF of a sheet: straightening the photo, running Audiveris, working out the notes |
 | `drumsheet/transcribe.py` | the built-in rules; shared helpers (`refine_details`, `onset_envelope`) |
 | `drumsheet/rhythm.py` | beats, tempo check, bar lines, quantisation, the `Score` data model |
 | `drumsheet/separation.py`, `audio_io.py` | Demucs, full-mix detection, loading, trimming, recording |

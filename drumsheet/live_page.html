@@ -31,8 +31,12 @@
   button.stop { background: var(--warn); border-color: var(--warn); color: #fff; }
   button:disabled { opacity: .45; cursor: default; }
   .grow { flex: 1 1 auto; }
-  .meter { width: 150px; height: 8px; background: var(--lane); border-radius: 4px; overflow: hidden; }
-  .meter > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .08s linear; }
+  .meter { width: 150px; height: 8px; background: var(--lane); border-radius: 4px; position: relative; }
+  .meter > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 4px;
+               transition: width .08s linear; }
+  .meter > i.quiet { background: var(--muted); }
+  .meter > b { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; background: var(--ink); }
+  input[type=range] { width: 130px; margin: 6px 0; accent-color: var(--accent); }
   .status { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 150px; text-align: right; }
   .stage { margin-top: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
            padding: 10px; display: grid; grid-template-columns: 148px 1fr; gap: 0 10px; }
@@ -66,11 +70,14 @@
     <label>Model <select id="model"></select></label>
     <label>Input <select id="device"></select></label>
     <label>Sensitivity <input id="sens" type="number" min="0.5" max="2" step="0.1" value="1" style="width:78px"></label>
+    <label title="Sounds quieter than this are never shown as hits. Raise it until the room's background stops showing up.">
+      <span>Ignore quieter than <span id="gatev"></span></span>
+      <input id="gate" type="range" min="-60" max="-6" step="1" value="-30"></label>
     <label class="grow">Test without a mic: path of an audio file (optional)
       <input id="simulate" type="text" placeholder="e.g. examples/demo_groove.flac"></label>
     <button id="go">Start</button>
     <div>
-      <div class="meter" title="input level"><i id="level"></i></div>
+      <div class="meter" title="input level; the mark is the quietest sound that counts as a hit"><i id="level"></i><b id="gatemark"></b></div>
       <div class="status" id="status">idle</div>
     </div>
   </div>
@@ -98,6 +105,7 @@ const COLORS = { crash:"#E69F00", ride:"#C9A227", hihat_open:"#56B4E9", hihat_cl
 const SECONDS = 8;                      // how much history the lanes show
 const $ = id => document.getElementById(id);
 let drums = [], hits = [], counts = {}, es = null, running = false;
+let mic = null;                         // set while this page records with its own microphone
 let clock = { t: 0, at: performance.now() };      // session time and when we learned it
 
 async function api(path, body) {
@@ -107,6 +115,14 @@ async function api(path, body) {
   if (!r.ok) throw new Error(data.detail || r.statusText);
   return data;
 }
+
+// The gate: how loud a sound has to be to count.  The mark on the meter shows it.
+const meterPos = db => Math.max(0, Math.min(100, (db + 60) * 1.7)) + "%";
+const showGate = () => { $("gatev").textContent = $("gate").value + " dB";
+                         if (!running) $("gatemark").style.left = meterPos(+$("gate").value); };
+$("gate").oninput = showGate;
+$("gate").onchange = () => { if (running) api("/live/api/gate", { gate_db: +$("gate").value }).catch(() => {}); };
+showGate();
 
 async function init() {
   const info = await api("/live/api/info");
@@ -122,9 +138,16 @@ async function init() {
   const hint = () => { const m = info.models.find(m => m.key === $("model").value);
                        $("modelhint").textContent = m ? m.label + ": " + m.description : ""; };
   $("model").onchange = hint; hint();
+  // Inputs: the microphones of the machine running drumsheet, and this browser's own -
+  // the one to use when the page is open somewhere else (a phone).
+  const own = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const here = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
   $("device").innerHTML = "";
-  if (!info.devices.length) $("device").add(new Option("no microphone found", ""));
-  for (const d of info.devices) $("device").add(new Option(d.name, d.index, d.default, d.default));
+  if (own) $("device").add(new Option("This browser's microphone", "browser"));
+  for (const d of info.devices) $("device").add(new Option(d.name, d.index, d.default, d.default && (here || !own)));
+  if (!own && !info.devices.length)
+    $("device").add(new Option(window.isSecureContext ? "no microphone found"
+                                                      : "no microphone found (this browser's needs https)", ""));
   for (const g of info.grids) $("grid").add(new Option({ "8":"8th notes","16":"16th notes","8t":"8th triplets","16t":"16th triplets" }[g] || g, g, g === "16", g === "16"));
   $("pads").innerHTML = "";
   for (const d of drums) {
@@ -154,7 +177,9 @@ function attach() {
       if (pad && e.t > clock.t - 1) { pad.classList.add("hit"); setTimeout(() => pad.classList.remove("hit"), 90); }
     } else if (e.type === "level") {
       clock = { t: e.t, at: performance.now() };
-      $("level").style.width = Math.max(0, Math.min(100, (e.db + 60) * 1.7)) + "%";
+      $("level").style.width = meterPos(e.peak);
+      $("level").classList.toggle("quiet", e.peak < e.gate);     // too quiet to count
+      $("gatemark").style.left = meterPos(e.gate);              // rises once loud strokes were heard
       $("status").textContent = e.t.toFixed(1) + " s  ·  " + hits.length + " hits";
     } else if (e.type === "end") {
       if (e.error) $("err").textContent = e.error;
@@ -168,27 +193,115 @@ async function finish() {
   if (es) { es.close(); es = null; }
   $("go").textContent = "Start"; $("go").classList.remove("stop"); $("go").disabled = true;
   try {
+    await micClose();                  // sends what was recorded last
     const r = await api("/live/api/stop", {});
     $("status").textContent = `take: ${r.seconds} s  ·  ${r.hits} hits`;
     $("chartmodel").value = $("model").value;
     $("after").classList.add("show");
   } catch (e) { $("err").textContent = e.message; }
-  $("go").disabled = false; $("level").style.width = "0";
+  $("go").disabled = false; $("level").style.width = "0"; showGate();
 }
 
 $("go").onclick = async () => {
   $("err").textContent = "";
   if (running) return finish();
   $("go").disabled = true;
+  const simulate = $("simulate").value.trim() || null;
+  const browser = !simulate && $("device").value === "browser";
   try {
-    await api("/live/api/start", { model: $("model").value, device: $("device").value || null,
-                                   simulate: $("simulate").value.trim() || null,
-                                   sensitivity: parseFloat($("sens").value) || 1 });
+    const rate = browser ? await micOpen() : null;      // first: it has to happen inside the click
+    await api("/live/api/start", { model: $("model").value, simulate, browser_rate: rate,
+                                   device: browser ? null : $("device").value || null,
+                                   sensitivity: parseFloat($("sens").value) || 1, gate_db: +$("gate").value });
+    if (browser) await micRun();
     clock = { t: 0, at: performance.now() };
     attach();
-  } catch (e) { $("err").textContent = e.message; }
+  } catch (e) { micClose(); $("err").textContent = e.message; }
   $("go").disabled = false;
 };
+
+// ---------------------------------------------------------------------------
+// This browser's own microphone: record here, post the audio to drumsheet in pieces.
+// ---------------------------------------------------------------------------
+async function micOpen() {
+  // The audio context is made before anything is awaited: browsers (Safari above
+  // all) only let one start as the direct result of a tap or click.
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume();
+  mic = { ctx, stream: null, nodes: [], pending: [], pump: null };
+  try {
+    // no speech processing: it is made for voices and flattens drum hits
+    mic.stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+  } catch (e) {
+    throw new Error("Could not use this browser's microphone: " + e.message);
+  }
+  return ctx.sampleRate;               // whatever the device records at; drumsheet converts
+}
+
+async function micRun() {
+  const m = mic, ctx = m.ctx;
+  const take = x => {                  // float samples -> 16-bit, queued for sending
+    const pcm = new Int16Array(x.length);
+    for (let i = 0; i < x.length; i++) pcm[i] = Math.max(-1, Math.min(1, x[i])) * 32767;
+    m.pending.push(pcm);
+  };
+  let tap;
+  try {                                // on the audio thread, where nothing gets dropped
+    const code = `registerProcessor("tap", class extends AudioWorkletProcessor {
+      constructor() { super(); this.buf = new Float32Array(2048); this.n = 0; }
+      process(inputs) {
+        const x = inputs[0][0];
+        if (x) for (let i = 0; i < x.length; i++) {
+          this.buf[this.n++] = x[i];
+          if (this.n === this.buf.length) { this.port.postMessage(this.buf.slice()); this.n = 0; }
+        }
+        return true;
+      } });`;
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "application/javascript" })));
+    tap = new AudioWorkletNode(ctx, "tap", { channelCount: 1, channelCountMode: "explicit" });
+    tap.port.onmessage = ev => take(ev.data);
+  } catch (e) {                        // browsers without audio worklets
+    tap = ctx.createScriptProcessor(4096, 1, 1);
+    tap.onaudioprocess = ev => take(ev.inputBuffer.getChannelData(0));
+  }
+  if (mic !== m) return;               // stopped in the meantime
+  const src = ctx.createMediaStreamSource(m.stream), mute = ctx.createGain();
+  mute.gain.value = 0;                 // the chain has to end at the output to run - silently
+  src.connect(tap); tap.connect(mute); mute.connect(ctx.destination);
+  m.nodes = [src, tap, mute];
+  m.pump = micPump(m);
+}
+
+async function micPump(m) {            // one request at a time, so the pieces arrive in order
+  const send = async () => {
+    const parts = m.pending; m.pending = [];
+    try {
+      await fetch("/live/api/audio", { method: "POST", body: new Blob(parts),
+                                       headers: { "Content-Type": "application/octet-stream" } });
+      return true;
+    } catch (e) {                      // connection hiccup: keep the audio and try again
+      m.pending = parts.concat(m.pending).slice(-1500);      // (at most about a minute of it)
+      return false;
+    }
+  };
+  while (mic === m) {
+    if (!m.pending.length || !(await send())) await new Promise(r => setTimeout(r, m.pending.length ? 500 : 100));
+  }
+  if (m.pending.length) await send();
+}
+
+async function micClose() {
+  const m = mic; mic = null;
+  if (!m) return;
+  for (const n of m.nodes) n.disconnect();
+  if (m.stream) m.stream.getTracks().forEach(t => t.stop());
+  try { await m.pump; } catch (e) {}
+  m.ctx.close();
+}
+
+// coming back to the page (phone unlocked, other app closed): the browser paused the audio
+document.addEventListener("visibilitychange", () => { if (mic && !document.hidden) mic.ctx.resume(); });
 
 $("chart").onclick = async () => {
   $("chart").disabled = true; $("err").textContent = ""; $("links").textContent = "working…";

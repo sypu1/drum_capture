@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import shutil
 import tempfile
 import warnings
@@ -21,8 +22,10 @@ from drumsheet.audio_io import AudioError
 from drumsheet.backends import all_backends
 from drumsheet.config import DRUM_ORDER, DRUMS, GRIDS
 from drumsheet.kit_model import train_kit
+from drumsheet.live_web import _state as live_state
 from drumsheet.live_web import router as live_router
 from drumsheet.pipeline import Options, run, run_compare
+from drumsheet.sheet import PAGE_TYPES, SHEET_TYPES
 
 warnings.filterwarnings("ignore")
 
@@ -77,27 +80,59 @@ def transcribe_ui(audio_path, model, compare, title, separate, grid, style, time
 # ---------------------------------------------------------------------------
 # Tab 3: train a kit model
 # ---------------------------------------------------------------------------
-def train_ui(name, takes, *drum_audio):
+def pair_up(uploads, written: tuple, what: str, pages: tuple = ()) -> list[tuple]:
+    """[(recording, the file that says what is played in it), ...] from one upload
+    box.  The two go together by name: take1.wav + take1.mid, or take1.wav +
+    take1_fixed.mid.  written: the extensions of the second kind.  pages: extensions
+    of pictures of a sheet, of which a recording may have several (its pages, in the
+    order of their names); for those the second of the pair is a list."""
+    paths = [Path(f) for f in uploads or []]
+    if not pages and any(p.suffix.lower() in PAGE_TYPES for p in paths):
+        raise gr.Error(f"This box takes recordings and their {what}s. A sheet as a photo or a PDF goes with "
+                       "its recording in the box for sheets.")
+    scores = [p for p in paths if p.suffix.lower() in written + pages]
+    audios = [p for p in paths if p not in scores]
+    if not paths:
+        return []
+    if not audios or not scores:
+        raise gr.Error(f"Every recording needs its {what}, and every {what} its recording: "
+                       f"got {len(audios)} recording(s) and {len(scores)} {what} file(s).")
+    mine: dict[Path, list[Path]] = {a: [] for a in audios}
+    for m in scores:
+        match = [a for a in audios if m.stem.startswith(a.stem) or a.stem.startswith(m.stem)]
+        match = [a for a in match if len(a.stem) == max(len(b.stem) for b in match)]   # song2.mid: song2.wav, not song.wav
+        if len(audios) == 1:
+            match = audios
+        if len(match) != 1:
+            raise gr.Error(f"Could not tell which recording '{m.name}' belongs to. Name them alike, "
+                           "e.g. take1.wav and take1.mid" + (", or song.m4a and song_1.jpg, song_2.jpg." if pages else "."))
+        mine[match[0]].append(m)
+    pairs = []
+    for a, files in mine.items():
+        if not files:
+            raise gr.Error(f"The recording '{a.name}' has no {what}.")
+        photos = [f for f in files if f.suffix.lower() in pages]
+        if len(files) > 1 and len(photos) < len(files):
+            raise gr.Error(f"'{a.name}' has more than one {what}: " + ", ".join(f.name for f in files)
+                           + ". Give one, or the pages of one as pictures.")
+        # pages in the order of their names, numbers counted as numbers (page2 before page10)
+        number = lambda f: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", f.name)]
+        pairs.append((a, sorted(photos, key=number) if photos else files[0]))
+    return pairs
+
+
+def train_ui(name, sheets, takes, *drum_audio):
     name = (name or "").strip()
     if not name or not all(ch.isalnum() or ch in "-_" for ch in name):
         raise gr.Error("Give the kit a name: letters, digits, '-' and '_' only.")
     files = {d: [a] for d, a in zip(DRUM_ORDER, drum_audio) if a}
-    # takes: each MIDI goes with the audio file whose name it starts with
-    # (take1.wav + take1.mid, or take1.wav + take1_fixed.mid)
-    paths = [Path(f) for f in takes or []]
-    midis = [p for p in paths if p.suffix.lower() in (".mid", ".midi")]
-    audios = [p for p in paths if p not in midis]
-    pairs = []
-    for m in midis:
-        match = [a for a in audios if m.stem.startswith(a.stem) or a.stem.startswith(m.stem)]
-        if len(audios) == 1 and len(midis) == 1:
-            match = audios
-        if len(match) != 1:
-            raise gr.Error(f"Could not tell which recording '{m.name}' belongs to. Name them alike, "
-                           "e.g. take1.wav and take1.mid.")
-        pairs.append((match[0], m))
-    if len(pairs) != len(audios):
-        raise gr.Error("Every take needs its MIDI file (and every MIDI file its take).")
+    pairs = pair_up(takes, (".mid", ".midi"), "MIDI file")
+    # a sheet but no recording: the take just made on the Live tab is the recording of it
+    sheets, used = list(sheets or []), ""
+    if sheets and all(Path(f).suffix.lower() in SHEET_TYPES + PAGE_TYPES for f in sheets) and live_state["take"]:
+        sheets.append(str(live_state["take"]))
+        used = "(No recording was uploaded with the sheet: used the take last recorded on the Live tab.)\n"
+    covers = pair_up(sheets, SHEET_TYPES, "sheet", PAGE_TYPES)
     log = io.StringIO()
     try:
         # keep the recordings: retraining later (with more takes) needs them
@@ -108,13 +143,28 @@ def train_ui(name, takes, *drum_audio):
             kept = keep / f"{d}{Path(path).suffix}"
             shutil.copy(path, kept)
             files[d] = [kept]
-        info = train_kit(name, files, pairs, log=lambda *a: print(*a, file=log))
+        info = train_kit(name, files, pairs, log=lambda *a: print(*a, file=log), sheets=covers)
     except AudioError as exc:
         raise gr.Error(str(exc))
     text = (f"Trained 'kit:{info['name']}' on {', '.join(DRUMS[c]['label'] for c in info['classes'])}.\n"
-            f"It is now in the model list on the other tabs (reload the Live tab).\n\n{log.getvalue()}")
+            f"It is now in the model list on the other tabs (reload the Live tab).\n\n{used}{log.getvalue()}")
     return text, gr.update(choices=model_choices(), value=f"kit:{info['name']}"), model_notes()
 
+
+def sheet_pictures_note() -> str:
+    """What the Train tab says about photos and PDFs of sheets: how, or that they cannot be read here."""
+    from drumsheet.omr import find_audiveris
+    try:
+        find_audiveris()
+    except AudioError:
+        return ("(Photos and PDFs cannot be read on this computer yet: that needs the program Audiveris, "
+                "see the README.)")
+    return ("Photos: one per page, the whole page in the picture, sharp, taken from above; reading takes "
+            "about half a minute per page. It has to be printed drum notation on five-line staves, in the "
+            "usual drum key (hi-hat x above the top line, snare in the third space, kick in the bottom space).")
+
+
+SHEET_PICTURES = sheet_pictures_note()
 
 # ---------------------------------------------------------------------------
 with gr.Blocks(title="drumsheet", analytics_enabled=False) as demo:   # no telemetry
@@ -156,19 +206,29 @@ with gr.Blocks(title="drumsheet", analytics_enabled=False) as demo:   # no telem
 
     with gr.Tab("Live"):
         gr.HTML('<iframe src="/live" style="width:100%;height:860px;border:0" '
-                'title="Live capture"></iframe>')
+                'allow="microphone" title="Live capture"></iframe>')
 
     with gr.Tab("Train my kit"):
         gr.Markdown(
-            "Teach a model **your** drums, room and microphone.\n\n"
-            "1. For each drum you have: record it **alone, about 10 hits, a second apart, soft to hard** "
-            "(or upload such a recording). Skip drums you do not have. Use the same microphone "
-            "position you will use for playing.\n"
-            "2. Optional, and the best way to improve it later: add real takes together with a "
-            "**corrected MIDI** (fix the app's MIDI in MuseScore or a DAW). Name them alike, "
-            "e.g. `take1.wav` + `take1.mid`.\n"
-            "3. Train - it takes well under a minute - then pick the new model on the other tabs.")
+            "Teach a model **your** drums, room and microphone. Any one of these is enough; "
+            "together they are better.\n\n"
+            "- **A sheet and your cover of it.** Play a piece you have the sheet of, record it on your "
+            "setup, and upload both: the recording, and the sheet as a **photo, a PDF, MIDI or "
+            "MusicXML**. Play it as written, repeats included; tempo and where the recording starts do "
+            "not matter. Best is to record it on the **Live** tab (the model then learns the sound that "
+            "tab hears) and to upload only the sheet here: the take you recorded last is used. "
+            + SHEET_PICTURES + " Several pieces: name each recording and its sheet alike, "
+            "e.g. `song.m4a` + `song.pdf`, or `song.m4a` + `song_1.jpg`, `song_2.jpg`.\n"
+            "- **Each drum alone.** For each drum you have, record it **alone, about 10 hits, a second "
+            "apart, soft to hard** (or upload such a recording). Skip drums you do not have. Use the "
+            "microphone position you will use for playing.\n"
+            "- **Takes with a corrected MIDI.** Transcribe a take, fix the app's MIDI in MuseScore or "
+            "a DAW, and add both. Name them alike, e.g. `take1.wav` + `take1.mid`.\n\n"
+            "Then train - a minute or so - and pick the new model on the other tabs.")
         kit_name = gr.Textbox(label="Name for this kit", placeholder="home")
+        # (no file_types here: phones grey out .musicxml and .mxl, which they do not know)
+        sheets = gr.File(label="A sheet (photo, PDF, MIDI or MusicXML) and your recording of it",
+                         file_count="multiple")
         drum_inputs = []
         for row_start in range(0, len(DRUM_ORDER), 3):
             with gr.Row():
@@ -179,14 +239,46 @@ with gr.Blocks(title="drumsheet", analytics_enabled=False) as demo:   # no telem
                         file_types=["audio", ".mid", ".midi"])
         train_button = gr.Button("Train", variant="primary")
         train_out = gr.Textbox(label="Training result", lines=14)
-        train_button.click(train_ui, [kit_name, takes, *drum_inputs], [train_out, model, notes])
+        train_button.click(train_ui, [kit_name, sheets, takes, *drum_inputs], [train_out, model, notes])
+
+# Gradio's recorders ask the browser for a microphone the way a phone call would: echo cancelling,
+# noise suppression, automatic gain.  That boosts every stroke to full level and reshapes its sound,
+# so a kit recorded on the Train tab did not sound like the same kit on the Live tab (which asks for
+# the plain microphone) and the trained model was unsure of most strokes.  Ask for the plain one here too.
+PLAIN_MICROPHONE = """<script>
+(() => {
+  const md = navigator.mediaDevices;
+  if (!md || !md.getUserMedia) return;
+  const ask = md.getUserMedia.bind(md);
+  md.getUserMedia = (want) => {
+    if (want && want.audio)
+      want = { ...want, audio: { ...(want.audio === true ? {} : want.audio), echoCancellation: false,
+                                 noiseSuppression: false, autoGainControl: false, channelCount: 1 } };
+    return ask(want);
+  };
+})();
+</script>"""
 
 # One server for everything: the live view's routes, then Gradio at "/".
 app = FastAPI()
 app.include_router(live_router)
-app = gr.mount_gradio_app(app, demo, path="/")
+app = gr.mount_gradio_app(app, demo, path="/", head=PLAIN_MICROPHONE)
+
+
+def device_note() -> str:
+    """Where the neural models (ADTOF, Demucs) will run.  Said once at startup,
+    because without a usable GPU they fall back to the CPU without a word."""
+    try:
+        import torch
+    except ImportError:
+        return "PyTorch is not installed: ADTOF and Demucs are unavailable"
+    if torch.cuda.is_available():
+        return f"ADTOF and Demucs run on the GPU ({torch.cuda.get_device_name(0)})"
+    return "ADTOF and Demucs run on the CPU (PyTorch sees no CUDA GPU)"
+
 
 if __name__ == "__main__":
     import uvicorn
+    print(device_note())
     print("drumsheet is running at  http://127.0.0.1:7860   (Ctrl-C to stop)")
     uvicorn.run(app, host="127.0.0.1", port=7860, log_level="warning")

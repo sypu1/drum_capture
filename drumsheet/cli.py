@@ -101,12 +101,15 @@ def _train(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="drumsheet train",
         description="Train a model on your own kit from short one-drum recordings "
-                    "(about 10 hits each, a second apart, soft and hard).",
+                    "(about 10 hits each, a second apart, soft and hard), and/or from "
+                    "a sheet and your recording of it.",
         epilog="Examples:\n"
                "  python -m drumsheet train home --dir calib/      (calib/kick.wav, calib/snare.wav, ...)\n"
                "  python -m drumsheet train home --kick k.wav --snare s.wav --hihat_closed hh.wav\n"
                "  python -m drumsheet train home --record          (guided recording, drum by drum)\n"
                "  python -m drumsheet train home --dir calib/ --pair take1.wav take1_fixed.mid\n"
+               "  python -m drumsheet train home --sheet my_cover.wav the_sheet.mid   (no one-drum recordings needed)\n"
+               "  python -m drumsheet train home --sheet my_cover.m4a page1.jpg page2.jpg   (photos of the sheet)\n"
                "Then:  python -m drumsheet take.wav --model kit:home",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("name", help="name for the kit model (letters, digits, - and _)")
@@ -116,6 +119,10 @@ def _train(argv: list[str]) -> int:
         p.add_argument(f"--{d}", nargs="+", metavar="FILE", help=f"recording(s) of the {spec['label'].lower()} alone")
     p.add_argument("--pair", nargs=2, action="append", metavar=("AUDIO", "MIDI"), default=[],
                    help="a real take plus its corrected drum MIDI (repeatable)")
+    p.add_argument("--sheet", nargs="+", action="append", metavar="FILE", default=[],
+                   help="your recording of a piece, then its sheet: a MIDI or MusicXML file, a PDF, or its "
+                        "pages as photos in order (needs Audiveris). The sheet is lined up with the recording "
+                        "automatically, whatever tempo you played at (repeatable)")
     p.add_argument("--record", action="store_true", help="record each drum now, guided, from the microphone")
     p.add_argument("--seconds", type=float, default=12.0, help="length of each guided recording (default 12)")
     args = p.parse_args(argv)
@@ -142,7 +149,10 @@ def _train(argv: list[str]) -> int:
                     continue
                 files.setdefault(d, []).append(record_microphone(args.seconds, folder / f"{d}.wav"))
         print(f"Training kit model '{args.name}'")
-        info = train_kit(args.name, files, [tuple(x) for x in args.pair])
+        if any(len(x) < 2 for x in args.sheet):
+            raise AudioError("--sheet takes the recording and then its sheet (one file, or its pages).")
+        info = train_kit(args.name, files, [tuple(x) for x in args.pair],
+                         sheets=[(x[0], x[1] if len(x) == 2 else x[1:]) for x in args.sheet])
     except AudioError as exc:
         print(f"\nerror: {exc}", file=sys.stderr)
         return 1
@@ -166,7 +176,8 @@ def _live(argv: list[str]) -> int:
     p.add_argument("--simulate", metavar="FILE", help="play a file through the live view instead of the mic")
     p.add_argument("--speed", type=float, default=1.0, help="with --simulate: playback speed")
     p.add_argument("--sensitivity", type=float, default=1.0)
-    p.add_argument("--gate-db", type=float, default=-45.0, help="ignore input quieter than this (dBFS)")
+    p.add_argument("--gate-db", type=float, default=-30.0,
+                   help="ignore sounds quieter than this (dBFS, default -30); lower it for a quiet recording")
     p.add_argument("-o", "--out-dir", default="output")
     p.add_argument("--no-chart", action="store_true", help="do not make a PDF from the take afterwards")
     args = p.parse_args(argv)

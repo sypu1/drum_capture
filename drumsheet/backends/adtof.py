@@ -44,11 +44,12 @@ class AdtofBackend(Backend):
     def _load(cls):
         if cls._model is None:
             import adtof_pytorch as A
+            import torch
             model = A.create_frame_rnn_model(A.calculate_n_bins())
             with contextlib.redirect_stdout(io.StringIO()):       # it prints while loading
                 model = A.load_pytorch_weights(model, A.get_default_weights_path(), strict=False)
             model.eval()
-            cls._model = model
+            cls._model = model.to("cuda" if torch.cuda.is_available() else "cpu")   # NVIDIA GPU if usable
         return cls._model
 
     def activations(self, y: np.ndarray) -> np.ndarray:
@@ -58,8 +59,10 @@ class AdtofBackend(Backend):
 
         proc = create_adtof_processor()                           # 44.1 kHz, 100 fps log-filterbank
         spec = proc.apply_filterbank(proc.compute_stft(y.astype(np.float32))).T[:, :, None]
+        model = self._load()
+        x = torch.from_numpy(np.ascontiguousarray(spec)).float().unsqueeze(0)
         with torch.no_grad():
-            out = self._load()(torch.from_numpy(np.ascontiguousarray(spec)).float().unsqueeze(0))
+            out = model(x.to(next(model.parameters()).device))
         return out[0].cpu().numpy()
 
     def transcribe(self, y, sr, sensitivity=1.0):

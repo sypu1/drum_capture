@@ -15,6 +15,10 @@ rules, this learns what each of your drums looks like from short recordings:
   4. Optionally you add real takes with a corrected MIDI file (fix the app's
      MIDI in a DAW or MuseScore, feed it back): those strokes are learned
      exactly as they sound in context.  This is the "retrain as you go" loop.
+  5. Or you skip the correcting: play a piece you have the sheet of, and give
+     the sheet with your recording.  sheet.py finds every written note in the
+     take; the strokes are then learned like those of step 4.  This works on
+     its own too, without step 1.
 
 Training takes seconds on a laptop CPU.  The result is saved as kits/<name>.joblib
 and appears as model "kit:<name>" everywhere.
@@ -47,6 +51,10 @@ POOLS = ((-1, 6), (6, 15), (15, 34))
 PRE_S = 0.015                      # snippets start this long before the onset
 FLOOR_DB = -60.0
 THRESHOLD = 0.6                    # a drum is reported if its forest is at least this sure
+UNSURE = 2 / 3                     # a stroke no forest is that sure of still gets its likeliest drum, down
+                                   # to this fraction of the threshold.  When the playing sounds a little
+                                   # unlike the training recordings every forest is less sure, and without
+                                   # this half the strokes went missing while the best guess was mostly right.
 
 _MEL = None
 
@@ -227,23 +235,46 @@ def _from_pair(audio_path, midi_path, classes: list[str], tol: float = 0.04):
     return np.array(X), np.array(Y)
 
 
+def _from_sheet(audio_path, notes: list, classes: list[str]):
+    """Real strokes with the labels the sheet gives them, from a recording of
+    someone playing that sheet (notes: sheet.read_sheet()).  Unlike a corrected
+    MIDI the sheet is not in time with the take; sheet.align() finds its notes.
+    Returns (X, Y, what the alignment found)."""
+    from .sheet import align
+
+    y = load_audio(audio_path, SR)
+    strokes, _ = detect_strokes(y, TranscribeConfig())
+    M = _mel_frames(y)
+    ref_db = _reference_db(M)
+    sound = np.array([_features(M, s["time"], ref_db) for s in strokes]).reshape(-1, 4 * N_MELS + 1)
+    found = align(notes, strokes, len(y) / SR, sound)
+    use = [j for j, names in enumerate(found.labels) if names is not None]     # (None: the sheet does not say)
+    Y = np.array([[1 if c in found.labels[j] else 0 for c in classes] for j in use]).reshape(-1, len(classes))
+    return sound[use], Y, found
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 def train_kit(name: str, drum_files: dict[str, list], pairs: list[tuple] | None = None,
-              n_mix: int = 3000, seed: int = 0, log=print) -> dict:
+              n_mix: int = 3000, seed: int = 0, log=print, sheets: list[tuple] | None = None) -> dict:
     """Train and save a kit model.
 
     drum_files: {"kick": [path, ...], "snare": [...], ...}  one-drum recordings
     pairs:      [(audio_path, midi_path), ...]              takes with corrected MIDI
+    sheets:     [(audio_path, sheet), ...]                  recordings of you playing a sheet, at any
+                                                            tempo.  sheet: a MIDI or MusicXML file, a
+                                                            PDF, or its pages as photos [path, ...]
     Returns the saved kit's info dict.
     """
     from sklearn.ensemble import ExtraTreesClassifier
     import joblib
+    from .sheet import PAGE_TYPES, read_sheet, sheet_name
 
     if not name or not all(ch.isalnum() or ch in "-_" for ch in name):
         raise AudioError("Kit name: letters, digits, '-' and '_' only.")
     pairs = pairs or []
+    sheets = [(audio, sheet, read_sheet(sheet, log)) for audio, sheet in sheets or []]
     unknown = set(drum_files) - set(DRUMS)
     if unknown:
         raise AudioError(f"Unknown drum(s): {', '.join(sorted(unknown))}. Use: {', '.join(DRUMS)}")
@@ -260,8 +291,9 @@ def train_kit(name: str, drum_files: dict[str, list], pairs: list[tuple] | None 
     few = [DRUMS[d]["label"] for d, s in snips.items() if len(s) < 4]
     if few:
         raise AudioError(f"Too few hits found for: {', '.join(few)}. Record at least 6, a second apart.")
-    if not snips and not pairs:
-        raise AudioError("Nothing to train on: give one-drum recordings and/or audio+MIDI pairs.")
+    if not snips and not pairs and not sheets:
+        raise AudioError("Nothing to train on: give one-drum recordings, a sheet with your recording "
+                         "of it, and/or audio+MIDI pairs.")
 
     classes = sorted(set(snips))
     if pairs and not classes:                     # pairs only: classes = what the MIDI contains
@@ -269,6 +301,7 @@ def train_kit(name: str, drum_files: dict[str, list], pairs: list[tuple] | None 
         classes = sorted({MIDI_ALIASES[n.pitch] for a, m in pairs
                           for inst in pretty_midi.PrettyMIDI(str(m)).instruments if inst.is_drum
                           for n in inst.notes if n.pitch in MIDI_ALIASES})
+    classes = sorted(set(classes) | {d for _, _, notes in sheets for _, d in notes})   # ... and every drum of the sheets
 
     def fit(Xa, Ya):
         # one forest per drum: "is this drum in the stroke?"  (Separate forests
@@ -282,36 +315,67 @@ def train_kit(name: str, drum_files: dict[str, list], pairs: list[tuple] | None 
                                                 n_jobs=-1, random_state=seed).fit(Xa, Ya[:, j]))
         return forests
 
+    def score(P, Y, names):
+        """F1 per drum; a drum that is not in the test strokes cannot be scored."""
+        out = {}
+        for j, c in enumerate(names):
+            tp = int(((P[:, j] >= THRESHOLD) & (Y[:, j] == 1)).sum())
+            fp = int(((P[:, j] >= THRESHOLD) & (Y[:, j] == 0)).sum())
+            fn = int(((P[:, j] < THRESHOLD) & (Y[:, j] == 1)).sum())
+            if tp + fn:
+                out[c] = round(2 * tp / max(2 * tp + fp + fn, 1), 2)
+        return out
+
     # ---- honest self-test: hold out a quarter of the recorded hits -----------
     report = {}
     if snips and min(len(s) for s in snips.values()) >= 8:
         tr = {c: s[: len(s) - len(s) // 4] for c, s in snips.items()}
         te = {c: s[len(s) - len(s) // 4:] for c, s in snips.items()}
         Xtr, Ytr, _ = _synthesise(tr, rng, n_mix // 2)
-        Xte, Yte, _ = _synthesise(te, rng, 600)
-        P = _predict(fit(Xtr, Ytr), Xte)
-        for j, c in enumerate(classes):
-            tp = int(((P[:, j] >= THRESHOLD) & (Yte[:, j] == 1)).sum())
-            fp = int(((P[:, j] >= THRESHOLD) & (Yte[:, j] == 0)).sum())
-            fn = int(((P[:, j] < THRESHOLD) & (Yte[:, j] == 1)).sum())
-            report[c] = round(2 * tp / max(2 * tp + fp + fn, 1), 2)
+        Xte, Yte, recorded = _synthesise(te, rng, 600)
+        report = score(_predict(fit(Xtr, Ytr), Xte), Yte, recorded)
         log("      self-test on held-out hits (F1, 1.0 = perfect): " +
             ", ".join(f"{DRUMS[c]['short']} {v:.2f}" for c, v in report.items()))
 
     # ---- final model on everything ---------------------------------------------
     parts_X, parts_Y = [], []
     if snips:
-        Xs, Ys, _ = _synthesise(snips, rng, n_mix)
-        parts_X.append(Xs); parts_Y.append(Ys)
+        Xs, Ys, recorded = _synthesise(snips, rng, n_mix)
+        wide = np.zeros((len(Ys), len(classes)), dtype=Ys.dtype)       # a drum only the sheets have
+        wide[:, [classes.index(c) for c in recorded]] = Ys             # is in none of the mixes
+        parts_X.append(Xs); parts_Y.append(wide)
     n_real = 0
-    for audio, midi in pairs:
-        Xp, Yp = _from_pair(audio, midi, classes)
+    real = [(Path(audio).name, *_from_pair(audio, midi, classes)) for audio, midi in pairs]
+    for audio, sheet, notes in sheets:
+        Xp, Yp, found = _from_sheet(audio, notes, classes)
+        log(f"      sheet {sheet_name(sheet)}: {found.summary()}")
+        if not isinstance(sheet, (str, Path)) or Path(sheet).suffix.lower() in PAGE_TYPES:
+            log(f"      (the tempo mark is not read from a picture, 120 is assumed: you played at about "
+                f"{120 * found.tempo:.0f} quarter notes a minute)")
+        real.append((Path(audio).name, Xp, Yp))
+    for take, Xp, Yp in real:
         n_real += len(Xp)
-        log(f"      take {Path(audio).name}: {len(Xp)} labelled strokes")
+        log(f"      take {take}: {len(Xp)} labelled strokes")
         # real strokes are worth more than synthetic ones
         reps = max(1, min(8, (n_mix // 4) // max(len(Xp), 1)))
         parts_X += [Xp] * reps; parts_Y += [Yp] * reps
     X, Y = np.concatenate(parts_X), np.concatenate(parts_Y)
+    if len(X) < 40:
+        raise AudioError("Too few strokes to learn from: the takes need to be longer, or to follow their sheets.")
+    if not snips and n_real >= 80:
+        # nothing but takes, so the self-test above had no single hits to hold out:
+        # learn from the first three quarters of each take, test on the last quarter
+        cut = [len(Xp) * 3 // 4 for _, Xp, _ in real]
+        model = fit(np.concatenate([Xp[:n] for (_, Xp, _), n in zip(real, cut)]),
+                    np.concatenate([Yp[:n] for (_, _, Yp), n in zip(real, cut)]))
+        report = score(_predict(model, np.concatenate([Xp[n:] for (_, Xp, _), n in zip(real, cut)])),
+                       np.concatenate([Yp[n:] for (_, _, Yp), n in zip(real, cut)]), classes)
+        log("      self-test on the last quarter of each take (F1, 1.0 = perfect): " +
+            ", ".join(f"{DRUMS[c]['short']} {v:.2f}" for c, v in report.items()))
+    weak = [DRUMS[c]["label"] for c, v in report.items() if v < 0.75]
+    if weak:
+        log("      NOT RELIABLE YET for " + ", ".join(weak) + ": the model mixes these up even in its own "
+            "recordings. Real playing teaches it more than more single hits: a take with its sheet.")
     clf = fit(X, Y)
 
     info = dict(name=name, classes=classes, created=datetime.datetime.now().isoformat(timespec="seconds"),
@@ -377,6 +441,8 @@ class KitBackend(Backend):
         hits = []
         for s, x, p in zip(strokes, X, P):
             names = [c for c, v in zip(classes, p) if v >= threshold]
+            if not names and p.max() >= UNSURE * threshold:
+                names = [classes[int(np.argmax(p))]]   # a stroke, but none is sure: the likeliest drum
             hats = [c for c in names if c.startswith("hihat")]
             if len(hats) == 2:                     # open and closed at once: keep the likelier
                 worse = min(hats, key=lambda c: p[classes.index(c)])

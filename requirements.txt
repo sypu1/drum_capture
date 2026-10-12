@@ -18,3 +18,7 @@ demucs>=4.0.1
 # --- optional model: ADTOF neural network (non-commercial licence, CC BY-NC-SA) ---
 # pip install torch
 # pip install git+https://github.com/xavriley/ADTOF-pytorch.git
+
+# --- optional: sheets as photos or PDFs, for "Train my kit" ---
+# Audiveris, a separate program: https://github.com/Audiveris/audiveris/releases
+# pip install pillow-heif        (iPhone HEIC photos)

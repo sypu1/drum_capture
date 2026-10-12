@@ -331,14 +331,19 @@ def classify_strokes(y: np.ndarray, strokes: list[dict], ctx: dict,
     # If most cymbals had to be found that way, the recording is dull, and a
     # cymbal under a kick or snare cannot be heard directly either: assume one
     # wherever the 3-7.5 kHz band reacted, and let pass 2 keep it only where
-    # the cymbal pattern is running on both sides.
+    # the cymbal pattern is running on both sides.  Under a kick, assume one
+    # even if no band reacted: the kick is so much louder that a hi-hat on top
+    # of it leaves no trace, and playing the hi-hat through the kicks is the
+    # normal thing to do.
     n_clear = sum(1 for h in labelled if h["cym"] and not h["weak"])
     n_weak = sum(1 for h in labelled if h["weak"])
     if n_weak > n_clear:
         for h in labelled:
-            if (h["kick"] or h["body"]) and not h["cym"] and ("air" in h["b"] or "high" in h["b"]):
+            heard = "air" in h["b"] or "high" in h["b"]
+            if (h["kick"] or h["body"]) and not h["cym"] and (h["kick"] or heard):
                 h["cym"] = "hihat_closed"
                 h["weak"] = True
+                h["guess"] = not heard
 
     # ---- pass 2: sanity-check simultaneous hits -----------------------------
     # snare + cymbal: snare wires reach right up into the cymbal band, so a
@@ -347,13 +352,24 @@ def classify_strokes(y: np.ndarray, strokes: list[dict], ctx: dict,
     cym_times = np.array([h["time"] for h in labelled if h["cym"] and h["body"] != "snare"
                           and not (h["weak"] and (h["kick"] or h["body"]))])
     if len(cym_times) >= 2:
-        window = float(np.clip(1.3 * np.median(np.diff(cym_times)), 0.15, 0.7))
+        gaps = np.diff(cym_times)
+        window = float(np.clip(1.3 * np.median(gaps), 0.15, 0.7))
+        # The cymbal's own pulse: its closest regular spacing.  A hi-hat assumed
+        # with nothing heard needs a place of its own in that pulse - a kick that
+        # falls between two hi-hat strokes is not also a hi-hat.
+        steady = gaps[gaps >= 0.07]
+        pulse = float(np.median(steady[steady < 1.5 * np.percentile(steady, 10)])) if len(steady) else 0.0
+        # ... and "on both sides" reaches three places for a kick: the strokes
+        # next to it are often a second kick or the snare, not hi-hats alone.
+        reach = float(np.clip(3 * pulse, window, 0.7))
         for h in labelled:
             if h["cym"] and (h["body"] == "snare" or (h["weak"] and (h["kick"] or h["body"]))):
                 d = cym_times - h["time"]
-                before = np.any((d < -0.03) & (d >= -window))
-                after = np.any((d > 0.03) & (d <= window))
-                if not (before and after) and h["cym"] != "crash":
+                near = reach if h["weak"] and h["kick"] else window
+                before = np.any((d < -0.03) & (d >= -near))
+                after = np.any((d > 0.03) & (d <= near))
+                crowded = h.get("guess") and np.any(np.abs(d[np.abs(d) > 0.03]) < 0.6 * pulse)
+                if (not (before and after) or crowded) and h["cym"] != "crash":
                     h["cym"] = None
 
     # ---- pass 3: name the toms ----------------------------------------------

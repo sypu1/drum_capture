@@ -2,8 +2,9 @@
 
 How it works
 ------------
-Audio arrives in small blocks (from the microphone, or from a file played at
-real-time speed for testing).  About ten times a second the last few seconds
+Audio arrives in small blocks (from the microphone of this computer or of the
+browser showing the live view, or from a file played at real-time speed for
+testing).  About ten times a second the last few seconds
 are handed to the selected model - the same one used for files - and every hit
 that is new and old enough to be "settled" (default 0.25 s) is sent to the
 display.  So what you see lags your playing by roughly a quarter of a second:
@@ -14,7 +15,7 @@ pipeline (which sees the take as a whole and is more accurate than the live
 guess) to make the PDF.
 
 Pieces
-    MicSource / FileSource   where the audio comes from
+    MicSource / BrowserSource / FileSource   where the audio comes from
     LiveEngine               rolling window -> newly settled hits
     LiveSession              thread that ties source, engine and listeners together
 """
@@ -87,6 +88,40 @@ class MicSource:
         self._stream.close()
 
 
+class BrowserSource:
+    """Audio recorded by the browser that shows the live view and sent here in
+    pieces - for when the page is open on another machine (a phone) than the one
+    running drumsheet, whose own microphone MicSource would use."""
+
+    def __init__(self, rate: int):
+        self._q: queue.Queue = queue.Queue()
+        self.finished = False
+        self._resample = None
+        if rate != SR:
+            # soxr comes with librosa.  It keeps its state from block to block, so the
+            # joins are seamless (resample_poly, block by block, leaves a click at each).
+            import soxr
+            self._resample = soxr.ResampleStream(rate, SR, 1, dtype="float32").resample_chunk
+
+    def push(self, block: np.ndarray) -> None:               # runs on the web server's thread
+        self._q.put(block)
+
+    def read(self) -> np.ndarray:
+        blocks = []
+        while True:
+            try:
+                blocks.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        if not blocks:
+            return np.zeros(0, dtype=np.float32)
+        y = np.concatenate(blocks).astype(np.float32)
+        return self._resample(y) if self._resample else y
+
+    def close(self):
+        self.finished = True
+
+
 class FileSource:
     """A file fed in at real-time speed - for trying the live view without a
     microphone, and for testing.  speed > 1 plays faster than real time."""
@@ -127,11 +162,11 @@ class LiveEngine:
     """Rolling window in, newly settled hits out."""
 
     def __init__(self, backend, window_s: float = 4.0, settle_s: float = 0.25,
-                 gate_db: float = -45.0, sensitivity: float = 1.0):
+                 gate_db: float = -30.0, sensitivity: float = 1.0):
         self.backend = backend
         self.window = int(window_s * SR)
         self.settle_s = settle_s
-        self.gate = 10 ** (gate_db / 20)
+        self.set_gate(gate_db)
         self.sensitivity = sensitivity
         self._buf = np.zeros(0, dtype=np.float32)
         self._total = 0                        # samples received so far
@@ -142,6 +177,17 @@ class LiveEngine:
     @property
     def now(self) -> float:
         return self._total / SR
+
+    def set_gate(self, gate_db: float) -> None:
+        """Sounds peaking below this level (dBFS) are never hits.  The built-in rules
+        judge loudness only relative to what else is in the window, so without a
+        gate every tap and word in a quiet room would be named as some drum."""
+        self.gate = 10 ** (gate_db / 20)
+
+    @property
+    def floor(self) -> float:
+        """What a stroke has to reach right now: the gate, or 6 % of the loudest stroke."""
+        return max(self.gate, 0.06 * self._loudest)
 
     def feed(self, block: np.ndarray) -> None:
         self._total += len(block)
@@ -156,7 +202,7 @@ class LiveEngine:
         peak = float(np.abs(self._buf).max())
         self._loudest = max(self._loudest * 0.999, peak)
         # Ignore anything far quieter than real playing: room noise, talking.
-        floor = max(self.gate, 0.06 * self._loudest)
+        floor = self.floor
         out: list[Hit] = []
         if peak >= floor:
             try:
@@ -238,7 +284,10 @@ class LiveSession:
                     for h in self.engine.process():
                         self.hits.append(h)
                         self._tell(dict(type="hit", t=h.time, drum=h.drum, vel=h.velocity))
-                    self._tell(dict(type="level", t=round(self.engine.now, 2), db=round(self.level_db, 1)))
+                    # peak and gate let the display show which sounds are too quiet to count
+                    peak_db, gate_db = 20 * np.log10(np.array([np.abs(piece).max(), self.engine.floor]) + 1e-9)
+                    self._tell(dict(type="level", t=round(self.engine.now, 2), db=round(self.level_db, 1),
+                                    peak=round(float(peak_db), 1), gate=round(float(gate_db), 1)))
         except Exception as exc:                 # report instead of dying silently
             self.error = str(exc)
         finally:
